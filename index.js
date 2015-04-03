@@ -1,98 +1,178 @@
-#!/usr/bin/env node
+var config        = require('./config');
+var GitHubApi     = require('github');
+var applescript   = require('applescript');
+var github        = new GitHubApi({ version: '3.0.0' });
+var sleep         = require('sleep');
+var temp          = require('temp');
+var fs            = require('fs');
 
-// var OmniFocus   = require('./OmniFocus');
+// authenticate to github
+github.authenticate({type: 'oauth', token: config.token });
 
-var config      = require('./config');
-var GitHubApi   = require('github');
-var applescript = require('applescript');
-var github      = new GitHubApi({ version: '3.0.0' });
-var sleep       = require('sleep');
+/**
+ * lastChecked = last time we polled the repo.
+ * Only get issues updated since then.
+ */
+var lastChecked;
+fs.readFile('./lastChecked.txt', 'utf8', function (err, data) {
+  if(err) handleError(err);
+  lastChecked = data;
+});
 
-github.authenticate({type: 'oauth', token: config.token});
-
+// Get github issues for repo
 github.issues.repoIssues({
-  // headers : 'If-Modified-Since'
-  // mentioned: 'nickbuddendotcom'
-  // since: ''
-  filter: 'assigned'
+  // mentioned: config.assignee
+   since: lastChecked
+  , filter: 'assigned'
   , state: 'all'
   , user: config.user
   , repo: config.repo
   , assignee: config.assignee
+  , per_page: 100 // TODO: breaks on more than 100 issues
 }, updateIssues);
 
+/**
+ * Update the issues that GitHub returns, if any.
+ *
+ * @param  {object} err    Error Message
+ * @param  {object} issues https://developer.github.com/v3/issues/
+ */
 function updateIssues(err, issues) {
+
+  // Save the time we've just polled
+  fs.writeFile('./lastChecked.txt', new Date().toISOString(), function(err) {
+    if(err) handleError(err);
+  });
+
   if(err || issues.length <= 0) {
     return;
   }
 
-  // Leaving off: this is an asshole. I want to have design and code contexts...
-  // - Add Due Date
-  // - Add Project (Beta)
-  // - Add Issue Link to title
-  // - Add issue desc to note
-  // - Store github ID's in a file, skip adding anything that's already got an ID in the file
-  // - Eventually I can handle updates as well...I can also save the last update date in a file and if anything has changed since then,
-  //   update it wiether or not the ID's in the file. I can also use that to close it. That should be enough github integration.
+  var script = formatScript(issues);
 
+  temp.open('github-to-omnifocus', function(err, info) {
+    if (err) handleError(err);
 
+    fs.write(info.fd, script);
+    fs.close(info.fd, function(err) {
+      if (err) handleError(err);
 
-  /*
-
-  TRY THIS:
-
--- Determine whether OmniFocus is running.
-tell application "System Events"
-  set omnifocusActive to count (every process whose name is "OmniFocus")
-end tell
-
-if omnifocusActive > 0 then
-  -- OmniFocus is running, so insert a task into it directly.
-  tell application "OmniFocus" to tell document 1
-    make new inbox task with properties {name:"TASK TITLE"}
-  end tell
-else
-  -- OmniFocus isn't running, so use the Mail Drop method.
-  do shell script "mail -s \"TASK TITLE\" " & mailDropAddress & " < /dev/null"
-end if
-
-
-   */
-
-
-
-  // note: add forever.js
-  // update each issue ...
-  // If already have the issue ID, return...(need to save the ID's for anything already processed...)
-  issues.forEach(function(issue) {
-
-    var githubName = '[#' + issue.number + '] ' + issue.title;
-    var script = 'parse tasks into it with transport text "' + githubName + '"';
-
-    script += ' and context '
-
-    var fullScript = 'tell application "OmniFocus"\ntell front document\n' + script + '\nend tell\nend tell\n';
-
-    var script = '';
-
-
-    sleep.usleep(100);
-    // executeScript(script, function(err, res) {
-    //   if (err) console.log(err);
-    //   callback();
-    // });
-
-    applescript.execString(fullScript, function(err) {
-      if (err) console.log(err);
+      applescript.execFile(info.path, ["-lJavaScript"], function(err, rtn) {
+        if (err) handleError(err);
+      });
     });
-
-    // It would be good to put the issue describption into the notes too...
-    // console.log('CHECK ISSUE', issue.title, issue.url, issue.number, issue.id);
   });
 }
 
-// http://pixelsnatch.com/omnifocus/ to Library/Script Libraries
-// 1. chmod +x githubOmnifocusSync.js
-// 2. sudo npm install -g (in directory, rerun to see changes)
-// 3. githubOmnifocusSync
-//
+/**
+ * Formation JavaScript to be run by Node Applescript:
+ * https://github.com/TooTallNate/node-applescript
+ *
+ * @param  {object} issues   JSON object of GitHub issues
+ * @return {string}          Formatted script to run
+ */
+function formatScript(issues) {
+  var script = '';
+
+  script += 'var of = Library(\'OmniFocus\');\n';
+  script += 'var name = "";\n';
+  script += 'var toClose = "";\n';
+
+  issues.forEach(function(issue) {
+
+    // If our config is set to listen to only certain
+    // milestones, ignore any issues without milestones
+    // or with different milestone
+    if(config.milestones.length > 0) {
+      if(!issue.milestone || issue.milestone.title.indexOf(config.milestones) === -1) {
+        return;
+      }
+    }
+
+    // Action Name
+    var name = '[#' + issue.number + '] ' + issue.title;
+
+    // Close open issues
+    if( issue.state === 'closed' ) {
+
+      script += closeActionScript(name);
+
+    // Create new open issues
+    } else if( issue.state === 'open' ) {
+
+      var note = (issue.body.length > 1) ? issue.html_url + '\n\n' + issue.body : issue.html_url;
+      var project = (issue.milestone && issue.milestone.title) ? issue.milestone.title : false;
+      var dueDate = (issue.milestone && issue.milestone.due_on) ? new Date(issue.milestone.due_on).toDateString() : false;
+
+      script += addActionScript(name, note, project, dueDate);
+    }
+
+  });
+
+  return script;
+}
+
+/**
+ * Add a new (unique) action to omnifocus.
+ *
+ * Uses OmniFocus transport text:
+ * Action! @Context ::Project #Start #Due $Duration //Note
+ *
+ *
+ * @param {string} name      Action Name
+ * @param {string} note      Action Note
+ * @param {string} project   Add To Project Name
+ * @param {string} dueDate   Date Due
+ */
+function addActionScript(name, note, project, dueDate) {
+  var script = '';
+
+  name = name.trim();
+
+  var transportText = name;
+
+  if(project) {
+    transportText += ' ::' + project;
+  }
+
+  if(dueDate) {
+    transportText += ' #' + dueDate;
+  }
+
+  if(note) {
+    transportText += ' //' + note;
+  }
+
+  script += "name = " + JSON.stringify(name) + ";"
+  script += 'if(of.tasksWithName(name).length <= 0) {';
+    script += "of.parse(" + JSON.stringify(transportText) + ")";
+  script += '}\n';
+
+  return script;
+}
+
+/**
+ * Mark an action as completed
+ *
+ * @return {[type]} [description]
+ */
+function closeActionScript(name) {
+  var script = '';
+
+  script += "name = " + JSON.stringify(name) + ";\n"
+  script += "toClose = of.tasksWithName(name);\n"
+  script += 'if(toClose.length > 0) {';
+    script += "of.setCompleted(toClose, true)";
+  script += '}\n';
+
+  return script;
+}
+
+/**
+ * Handle errors in a dumb way.
+ *
+ * @param  {object} err Error code
+ */
+function handleError(err) {
+  console.log('err', err);
+}
